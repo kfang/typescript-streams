@@ -1,7 +1,9 @@
-import {pipeline, Readable, Transform, Writable} from "stream";
+import {pipeline, PassThrough, Readable, Transform, Writable, Duplex} from "stream";
 import fs, {PathLike} from "fs";
 import {promisify} from "util";
 import {LineTransformer} from "./line.transformer";
+import {AsyncMapTransformer, MapTransformer} from "./map.transformer";
+import {GroupedTransformer} from "./grouped.transformer";
 
 export class TypedPipeline<T1> {
 
@@ -23,7 +25,7 @@ export class TypedPipeline<T1> {
         return new TypedPipeline<T>(readable);
     }
 
-    private readonly _stages: Array<Readable | Writable>;
+    private readonly _stages: Array<Readable | Duplex>;
 
     private constructor(source: Readable) {
         this._stages = [source];
@@ -36,20 +38,14 @@ export class TypedPipeline<T1> {
     }
 
     public map<T2>(fn: (t1: T1) => T2): TypedPipeline<T2> {
-        const t = new Transform({
-            objectMode: true,
-            transform(chunk: T1, encoding: string, callback: (error?: (Error | null), data?: any) => void): void {
-                try {
-                    this.push(fn(chunk));
-                    callback();
-                } catch (e) {
-                    callback(e);
-                }
-            },
-        });
-
+        const t = new MapTransformer(fn);
         this._stages.push(t);
+        return (this as any as TypedPipeline<T2>);
+    }
 
+    public mapAsync<T2>(fn: (t1: T1) => Promise<T2>): TypedPipeline<T2> {
+        const t = new AsyncMapTransformer(fn);
+        this._stages.push(t);
         return (this as any as TypedPipeline<T2>);
     }
 
@@ -73,6 +69,19 @@ export class TypedPipeline<T1> {
         return this;
     }
 
+    public grouped(size: number): TypedPipeline<T1[]> {
+        const t = new GroupedTransformer(size);
+        this._stages.push(t);
+        return this as any as TypedPipeline<T1[]>;
+    }
+
+    public throttle(ms: number): TypedPipeline<T1> {
+        return this.mapAsync(async (t1: T1) => {
+            await new Promise((resolve) => setTimeout(resolve, ms));
+            return t1;
+        });
+    }
+
     public async foreach(fn: (t1: T1) => void): Promise<void> {
         const w = new Writable({
             objectMode: true,
@@ -86,9 +95,7 @@ export class TypedPipeline<T1> {
             },
         });
 
-        this._stages.push(w);
-
-        return promisify(pipeline)(this._stages);
+        return promisify(pipeline)([...this._stages, w]);
     }
 
     public async reduce<T2>(fn: (r: T2, t1: T1) => T2, o: T2): Promise<T2> {
@@ -106,9 +113,8 @@ export class TypedPipeline<T1> {
             }
         });
 
-        this._stages.push(w);
-        await promisify(pipeline)(this._stages);
-        return  res;
+        await promisify(pipeline)([...this._stages, w]);
+        return res;
     }
 
     public async toArray(): Promise<Array<T1>> {
@@ -117,6 +123,12 @@ export class TypedPipeline<T1> {
             return r;
         };
         return this.reduce(fn, []);
+    }
+
+    public toReadable(cb: (err: (NodeJS.ErrnoException | null)) => void): Readable {
+        const pass = new PassThrough();
+        pipeline([...this._stages, pass], cb);
+        return pass;
     }
 
 }
